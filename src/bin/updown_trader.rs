@@ -552,18 +552,25 @@ async fn main() -> Result<()> {
 
     let (mut write, mut read) = ws_stream.split();
 
-    // 订阅所有 token
+    // 收集所有需要订阅的 token ID
+    let mut all_token_ids = Vec::new();
     for asset in &config.enabled_assets {
         if let Some(round) = round_manager.get_round(asset).await {
-            let subscribe_msg = serde_json::json!({
-                "type": "subscribe",
-                "channel": "market",
-                "markets": [round.up_token_id, round.down_token_id]
-            });
-
-            write.send(Message::Text(subscribe_msg.to_string())).await?;
-            info!("📡 订阅 WebSocket: {} / {}", round.up_token_id, round.down_token_id);
+            all_token_ids.push(round.up_token_id.clone());
+            all_token_ids.push(round.down_token_id.clone());
+            info!("📋 准备订阅 {}: {} / {}", asset, round.up_token_id, round.down_token_id);
         }
+    }
+
+    // 发送订阅消息（参考 src/polymarket.rs 的正确格式）
+    if !all_token_ids.is_empty() {
+        let subscribe_msg = serde_json::json!({
+            "assets_ids": all_token_ids,
+            "type": "market"
+        });
+
+        write.send(Message::Text(subscribe_msg.to_string())).await?;
+        info!("✅ 已发送订阅请求，共 {} 个 token", all_token_ids.len());
     }
 
     info!("✅ WebSocket 连接成功，开始监听价格...");
