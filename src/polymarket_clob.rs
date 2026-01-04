@@ -407,11 +407,23 @@ pub struct PolymarketAsyncClient {
     funder: String,
     wallet_address_str: String,
     address_header: HeaderValue,
+    signature_type: i32,  // 0=EOA, 1=Gnosis Safe, 2=Poly Proxy
 }
 
 impl PolymarketAsyncClient {
     pub fn new(host: &str, chain_id: u64, private_key: &str, funder: &str) -> Result<Self> {
+        Self::new_with_signature_type(host, chain_id, private_key, funder, 2)
+    }
+
+    pub fn new_with_signature_type(
+        host: &str,
+        chain_id: u64,
+        private_key: &str,
+        funder: &str,
+        signature_type: i32,
+    ) -> Result<Self> {
         let wallet = private_key.parse::<LocalWallet>()?.with_chain_id(chain_id);
+        // 使用 EIP-55 checksum 格式（混合大小写）
         let wallet_address_str = format!("{:?}", wallet.address());
         let address_header = HeaderValue::from_str(&wallet_address_str)
             .map_err(|e| anyhow!("Invalid wallet address for header: {}", e))?;
@@ -425,6 +437,12 @@ impl PolymarketAsyncClient {
             .timeout(std::time::Duration::from_secs(10))
             .build()?;
 
+        // 打印调试信息
+        tracing::info!(
+            "Polymarket 客户端初始化: wallet={}, funder={}, signature_type={}",
+            wallet_address_str, funder, signature_type
+        );
+
         Ok(Self {
             host: host.trim_end_matches('/').to_string(),
             chain_id,
@@ -433,6 +451,7 @@ impl PolymarketAsyncClient {
             funder: funder.to_string(),
             wallet_address_str,
             address_header,
+            signature_type,
         })
     }
 
@@ -440,25 +459,49 @@ impl PolymarketAsyncClient {
     /// wallet.sign_hash() is CPU-bound (~1ms), safe to call in async context
     fn build_l1_headers(&self, nonce: u64) -> Result<HeaderMap> {
         let timestamp = current_unix_ts();
+
+        tracing::debug!(
+            "构建认证头: address={}, timestamp={}, nonce={}, chain_id={}",
+            self.wallet_address_str, timestamp, nonce, self.chain_id
+        );
+
         let digest = clob_auth_digest(self.chain_id, &self.wallet_address_str, timestamp, nonce)?;
+
+        tracing::debug!("EIP712 digest: {:?}", digest);
+
         let sig = self.wallet.sign_hash(digest)?;
+
+        tracing::debug!("签名结果: 0x{}", sig);
+
         let mut headers = HeaderMap::new();
         headers.insert("POLY_ADDRESS", self.address_header.clone());
         headers.insert("POLY_SIGNATURE", HeaderValue::from_str(&format!("0x{}", sig))?);
         headers.insert("POLY_TIMESTAMP", HeaderValue::from_str(&timestamp.to_string())?);
         headers.insert("POLY_NONCE", HeaderValue::from_str(&nonce.to_string())?);
         add_default_headers(&mut headers);
+
+        tracing::debug!("认证头构建完成");
+
         Ok(headers)
     }
 
     /// Derive API credentials from L1 wallet signature
     pub async fn derive_api_key(&self, nonce: u64) -> Result<ApiCreds> {
+        tracing::info!(
+            "派生 API Key: address={}, nonce={}",
+            self.wallet_address_str, nonce
+        );
+
         let url = format!("{}/auth/derive-api-key", self.host);
         let headers = self.build_l1_headers(nonce)?;
         let resp = self.http.get(&url).headers(headers).send().await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
+            tracing::error!(
+                "派生 API Key 失败: status={}, body={}, address={}, nonce={}",
+                status, body, self.wallet_address_str, nonce
+            );
             return Err(anyhow!("derive-api-key failed: {} {}", status, body));
         }
         Ok(resp.json().await?)
@@ -672,7 +715,12 @@ impl SharedAsyncClient {
         let maker_amount_str = maker_amt.to_string();
         let taker_amount_str = taker_amt.to_string();
 
-        // Use references for EIP712 signing 
+        tracing::debug!(
+            "签名订单: side={}, maker={}, signer={}, signature_type={}",
+            side, self.inner.funder, self.inner.wallet_address_str, self.inner.signature_type
+        );
+
+        // Use references for EIP712 signing
         let data = OrderData {
             maker: &self.inner.funder,
             taker: ZERO_ADDRESS,
@@ -684,7 +732,7 @@ impl SharedAsyncClient {
             nonce: "0",
             signer: &self.inner.wallet_address_str,
             expiration: "0",
-            signature_type: 1,
+            signature_type: self.inner.signature_type,
             salt,
         };
         let exchange = get_exchange_address(self.chain_id, neg_risk)?;
@@ -707,7 +755,7 @@ impl SharedAsyncClient {
                 nonce: "0".to_string(),
                 fee_rate_bps: "0".to_string(),
                 side: side_code,
-                signature_type: 1,
+                signature_type: self.inner.signature_type,
             },
             signature: format!("0x{}", sig),
         })
