@@ -34,10 +34,14 @@ pub struct RoundInfo {
 /// - 生成 15 分钟轮次的 slug
 /// - 从 Polymarket Gamma API 获取 token IDs
 /// - 管理多资产（BTC/ETH/SOL）的当前轮次
+/// - **预加载下一轮次**，实现零延迟切换
 /// - 检测轮次是否结束
 pub struct RoundManager {
     /// 当前活跃轮次（资产名 → RoundInfo）
     current_rounds: Arc<RwLock<HashMap<String, RoundInfo>>>,
+
+    /// 下一轮次（预加载，资产名 → RoundInfo）
+    next_rounds: Arc<RwLock<HashMap<String, RoundInfo>>>,
 
     /// Gamma API 客户端（复用现有代码）
     gamma_client: Arc<GammaClient>,
@@ -54,6 +58,7 @@ impl RoundManager {
     pub fn new(enabled_assets: Vec<String>) -> Self {
         Self {
             current_rounds: Arc::new(RwLock::new(HashMap::new())),
+            next_rounds: Arc::new(RwLock::new(HashMap::new())),
             gamma_client: Arc::new(GammaClient::new()),
             enabled_assets,
         }
@@ -90,9 +95,9 @@ impl RoundManager {
         (start_timestamp, end_timestamp)
     }
 
-    /// 初始化所有启用资产的当前轮次
+    /// 初始化所有启用资产的当前轮次和下一轮次
     ///
-    /// 应在程序启动时调用，会重试直到找到市场
+    /// 应在程序启动时调用，会重试直到找到市场，并预加载下一轮次实现零延迟切换
     pub async fn initialize_all_rounds(&self) -> Result<()> {
         for asset in &self.enabled_assets {
             // 重试机制：最多尝试 10 次，每次间隔 2 秒
@@ -100,7 +105,17 @@ impl RoundManager {
             loop {
                 match self.fetch_and_update_round(asset).await {
                     Ok(_) => {
-                        tracing::info!("✅ {} 轮次初始化成功", asset);
+                        tracing::info!("✅ {} 当前轮次初始化成功", asset);
+
+                        // 预加载下一轮次（后台任务，失败不影响启动）
+                        let asset_clone = asset.clone();
+                        let self_clone = self.clone_for_background();
+                        tokio::spawn(async move {
+                            if let Err(e) = self_clone.preload_next_round(&asset_clone).await {
+                                tracing::warn!("⚠️  预加载 {} 下一轮次失败: {}（稍后会重试）", asset_clone, e);
+                            }
+                        });
+
                         break;
                     }
                     Err(e) => {
@@ -114,6 +129,47 @@ impl RoundManager {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// 克隆必要字段用于后台任务
+    fn clone_for_background(&self) -> Self {
+        Self {
+            current_rounds: self.current_rounds.clone(),
+            next_rounds: self.next_rounds.clone(),
+            gamma_client: self.gamma_client.clone(),
+            enabled_assets: self.enabled_assets.clone(),
+        }
+    }
+
+    /// 预加载下一轮次（后台异步）
+    async fn preload_next_round(&self, asset: &str) -> Result<()> {
+        let (_, current_end_ts) = Self::get_current_round_boundaries();
+        let next_start_ts = current_end_ts;
+        let next_end_ts = next_start_ts + 900;
+
+        let slug = Self::generate_slug(asset, next_start_ts);
+        tracing::debug!("🔮 预加载下一轮次: {}", slug);
+
+        let tokens = self.gamma_client.lookup_market(&slug).await?;
+
+        let Some((up_token_id, down_token_id)) = tokens else {
+            return Err(anyhow!("未找到下一轮次市场: {}", slug));
+        };
+
+        let next_round = RoundInfo {
+            slug: slug.clone(),
+            up_token_id,
+            down_token_id,
+            start_timestamp: next_start_ts,
+            end_timestamp: next_end_ts,
+            asset: asset.to_uppercase(),
+        };
+
+        let mut next_rounds = self.next_rounds.write().await;
+        next_rounds.insert(asset.to_uppercase(), next_round);
+
+        tracing::info!("✅ {} 下一轮次预加载成功: {}", asset, slug);
         Ok(())
     }
 
@@ -202,15 +258,43 @@ impl RoundManager {
 
     /// 切换到下一个轮次（当当前轮次结束时调用）
     ///
-    /// 会重试直到找到新轮次的市场
+    /// 使用预加载的下一轮次，实现**零延迟切换**
     ///
     /// # 返回
     /// - `Ok(RoundInfo)` - 新轮次信息
-    /// - `Err` - 获取失败（尝试 10 次后仍失败）
+    /// - `Err` - 预加载的轮次不存在（不应该发生）
     pub async fn switch_to_next_round(&self, asset: &str) -> Result<RoundInfo> {
         tracing::info!("🔄 {} 轮次结束，切换到下一轮次...", asset);
 
-        // 重试机制：最多尝试 10 次，每次间隔 2 秒
+        // 尝试从预加载的下一轮次中获取
+        let next_round = {
+            let mut next_rounds = self.next_rounds.write().await;
+            next_rounds.remove(&asset.to_uppercase())
+        };
+
+        if let Some(round) = next_round {
+            // 零延迟切换：直接使用预加载的轮次
+            let mut current_rounds = self.current_rounds.write().await;
+            current_rounds.insert(asset.to_uppercase(), round.clone());
+            drop(current_rounds);
+
+            tracing::info!("✅ {} 切换到新轮次: {} (预加载)", asset, round.slug);
+
+            // 立即预加载再下一轮次
+            let asset_clone = asset.to_string();
+            let self_clone = self.clone_for_background();
+            tokio::spawn(async move {
+                if let Err(e) = self_clone.preload_next_round(&asset_clone).await {
+                    tracing::warn!("⚠️  预加载 {} 再下一轮次失败: {}", asset_clone, e);
+                }
+            });
+
+            return Ok(round);
+        }
+
+        // 备用方案：如果预加载失败，则实时查询（有延迟）
+        tracing::warn!("⚠️  {} 下一轮次未预加载，使用实时查询（会有延迟）", asset);
+
         let mut attempts = 0;
         loop {
             match self.fetch_and_update_round(asset).await {
@@ -219,7 +303,17 @@ impl RoundManager {
                         .await
                         .ok_or_else(|| anyhow!("切换轮次后无法获取信息"))?;
 
-                    tracing::info!("✅ {} 切换到新轮次: {}", asset, round.slug);
+                    tracing::info!("✅ {} 切换到新轮次: {} (实时查询)", asset, round.slug);
+
+                    // 预加载下一轮次
+                    let asset_clone = asset.to_string();
+                    let self_clone = self.clone_for_background();
+                    tokio::spawn(async move {
+                        if let Err(e) = self_clone.preload_next_round(&asset_clone).await {
+                            tracing::warn!("⚠️  预加载 {} 下一轮次失败: {}", asset_clone, e);
+                        }
+                    });
+
                     return Ok(round);
                 }
                 Err(e) => {

@@ -136,6 +136,12 @@ struct GammaMarket {
     clob_token_ids: Option<String>,
     active: Option<bool>,
     closed: Option<bool>,
+    #[serde(rename = "endDate")]
+    #[allow(dead_code)]  // 保留用于未来功能
+    end_date: Option<String>,  // ISO 8601 格式，如 "2026-01-06T13:30:00Z"
+    #[serde(rename = "acceptingOrders")]
+    #[allow(dead_code)]  // 保留用于未来功能
+    accepting_orders: Option<bool>,
 }
 
 /// Increment the date in a Polymarket slug by 1 day
