@@ -575,6 +575,9 @@ async fn main() -> Result<()> {
 
     info!("✅ WebSocket 连接成功，开始监听价格...");
 
+    // 维护每个 token 的最新价格（token_id -> (price_bps, snapshot)）
+    let mut token_prices: HashMap<String, (u16, BookSnapshot)> = HashMap::new();
+
     // 主循环：处理 WebSocket 消息
     while let Some(msg) = read.next().await {
         let msg = match msg {
@@ -586,26 +589,32 @@ async fn main() -> Result<()> {
         };
 
         if let Message::Text(text) = msg {
-            // 只处理订单簿快照（BookSnapshot）- 包含真实的订单簿数据
-            if let Ok(snapshot) = serde_json::from_str::<BookSnapshot>(&text) {
-                // 找到对应的资产
-                if let Some((asset, _side, round)) = find_asset_by_token(&traders, &snapshot.asset_id).await {
-                    // 提取 ask 价格
+            // 正确的格式：WebSocket 返回的是订单簿数组
+            if let Ok(snapshots) = serde_json::from_str::<Vec<BookSnapshot>>(&text) {
+                // 更新每个 token 的价格
+                for snapshot in snapshots {
                     if !snapshot.asks.is_empty() {
                         if let Ok(price_f64) = snapshot.asks[0].price.parse::<f64>() {
                             let price_bps = (price_f64 * 10000.0) as u16;
+                            token_prices.insert(snapshot.asset_id.clone(), (price_bps, snapshot));
+                        }
+                    }
+                }
 
-                            // 获取 up/down 价格
-                            let (up_ask, down_ask) = get_current_prices(&round, &snapshot.asset_id, price_bps).await;
-
-                            // 处理价格更新（使用真实的 BookSnapshot）
-                            if let Some(trader) = traders.get(&asset) {
-                                if let Err(e) = trader
-                                    .on_price_update(up_ask, down_ask, &snapshot)
-                                    .await
-                                {
-                                    error!("处理订单簿快照失败: {}", e);
-                                }
+                // 对每个资产，检查是否同时有 up 和 down 的价格
+                for (asset, trader) in &traders {
+                    if let Some(round) = round_manager.get_round(asset).await {
+                        // 获取 up 和 down 的真实价格
+                        if let (Some((up_ask, up_snapshot)), Some((down_ask, _down_snapshot))) = (
+                            token_prices.get(&round.up_token_id),
+                            token_prices.get(&round.down_token_id),
+                        ) {
+                            // 使用 up 侧的订单簿快照（两个都可以，选一个即可）
+                            if let Err(e) = trader
+                                .on_price_update(*up_ask, *down_ask, up_snapshot)
+                                .await
+                            {
+                                error!("处理价格更新失败 ({}): {}", asset, e);
                             }
                         }
                     }
@@ -617,28 +626,4 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// 根据 token_id 找到对应的资产和侧
-async fn find_asset_by_token(
-    traders: &HashMap<String, AssetTrader>,
-    token_id: &str,
-) -> Option<(String, String, RoundInfo)> {
-    for (asset, trader) in traders {
-        if let Some(round) = trader.round_manager.get_round(asset).await {
-            if round.up_token_id == token_id {
-                return Some((asset.clone(), "up".to_string(), round));
-            } else if round.down_token_id == token_id {
-                return Some((asset.clone(), "down".to_string(), round));
-            }
-        }
-    }
-    None
-}
 
-/// 获取当前 up/down 价格（简化：需要实际维护订单簿状态）
-async fn get_current_prices(round: &RoundInfo, token_id: &str, price_bps: u16) -> (u16, u16) {
-    if token_id == round.up_token_id {
-        (price_bps, 10000 - price_bps) // 简化：假设 up + down = 1.0
-    } else {
-        (10000 - price_bps, price_bps)
-    }
-}
