@@ -94,7 +94,9 @@ impl GammaClient {
     
     async fn try_lookup_slug(&self, slug: &str) -> Result<Option<(String, String)>> {
         let url = format!("{}/markets?slug={}", GAMMA_API_BASE, slug);
-        
+
+        tracing::debug!("🔍 查询市场: {}", url);
+
         let resp = self.http.get(&url).send().await?;
         
         if !resp.status().is_success() {

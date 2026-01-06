@@ -92,10 +92,27 @@ impl RoundManager {
 
     /// 初始化所有启用资产的当前轮次
     ///
-    /// 应在程序启动时调用
+    /// 应在程序启动时调用，会重试直到找到市场
     pub async fn initialize_all_rounds(&self) -> Result<()> {
         for asset in &self.enabled_assets {
-            self.fetch_and_update_round(asset).await?;
+            // 重试机制：最多尝试 10 次，每次间隔 2 秒
+            let mut attempts = 0;
+            loop {
+                match self.fetch_and_update_round(asset).await {
+                    Ok(_) => {
+                        tracing::info!("✅ {} 轮次初始化成功", asset);
+                        break;
+                    }
+                    Err(e) => {
+                        attempts += 1;
+                        if attempts >= 10 {
+                            return Err(anyhow!("初始化 {} 失败（尝试 {} 次）: {}", asset, attempts, e));
+                        }
+                        tracing::warn!("⚠️  初始化 {} 失败（第 {}/10 次）: {}，2秒后重试...", asset, attempts, e);
+                        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -107,11 +124,13 @@ impl RoundManager {
         let (start_ts, end_ts) = Self::get_current_round_boundaries();
         let slug = Self::generate_slug(asset, start_ts);
 
+        tracing::debug!("🔍 查找市场: {} (时间戳: {})", slug, start_ts);
+
         // 调用现有的 GammaClient（复用代码）
         let tokens = self.gamma_client.lookup_market(&slug).await?;
 
         let Some((up_token_id, down_token_id)) = tokens else {
-            return Err(anyhow!("未找到市场: {}", slug));
+            return Err(anyhow!("未找到市场 slug: {} (可能市场尚未创建，或 slug 格式不对)", slug));
         };
 
         let round_info = RoundInfo {
@@ -183,15 +202,36 @@ impl RoundManager {
 
     /// 切换到下一个轮次（当当前轮次结束时调用）
     ///
+    /// 会重试直到找到新轮次的市场
+    ///
     /// # 返回
     /// - `Ok(RoundInfo)` - 新轮次信息
-    /// - `Err` - 获取失败
+    /// - `Err` - 获取失败（尝试 10 次后仍失败）
     pub async fn switch_to_next_round(&self, asset: &str) -> Result<RoundInfo> {
-        self.fetch_and_update_round(asset).await?;
+        tracing::info!("🔄 {} 轮次结束，切换到下一轮次...", asset);
 
-        self.get_round(asset)
-            .await
-            .ok_or_else(|| anyhow!("切换轮次后无法获取信息"))
+        // 重试机制：最多尝试 10 次，每次间隔 2 秒
+        let mut attempts = 0;
+        loop {
+            match self.fetch_and_update_round(asset).await {
+                Ok(_) => {
+                    let round = self.get_round(asset)
+                        .await
+                        .ok_or_else(|| anyhow!("切换轮次后无法获取信息"))?;
+
+                    tracing::info!("✅ {} 切换到新轮次: {}", asset, round.slug);
+                    return Ok(round);
+                }
+                Err(e) => {
+                    attempts += 1;
+                    if attempts >= 10 {
+                        return Err(anyhow!("切换 {} 轮次失败（尝试 {} 次）: {}", asset, attempts, e));
+                    }
+                    tracing::warn!("⚠️  切换 {} 轮次失败（第 {}/10 次）: {}，2秒后重试...", asset, attempts, e);
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                }
+            }
+        }
     }
 }
 
