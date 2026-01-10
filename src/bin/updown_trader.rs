@@ -544,86 +544,149 @@ async fn main() -> Result<()> {
 
     info!("✅ 策略模块初始化完成");
 
-    // 连接 WebSocket
-    info!("🔌 连接 Polymarket WebSocket...");
-
-    let (ws_stream, _) = connect_async(POLYMARKET_WS_URL).await
-        .context("WebSocket 连接失败")?;
-
-    let (mut write, mut read) = ws_stream.split();
-
-    // 收集所有需要订阅的 token ID
-    let mut all_token_ids = Vec::new();
-    for asset in &config.enabled_assets {
-        if let Some(round) = round_manager.get_round(asset).await {
-            all_token_ids.push(round.up_token_id.clone());
-            all_token_ids.push(round.down_token_id.clone());
-            info!("📋 准备订阅 {}: {} / {}", asset, round.up_token_id, round.down_token_id);
-        }
-    }
-
-    // 发送订阅消息（参考 src/polymarket.rs 的正确格式）
-    if !all_token_ids.is_empty() {
-        let subscribe_msg = serde_json::json!({
-            "assets_ids": all_token_ids,
-            "type": "market"
-        });
-
-        write.send(Message::Text(subscribe_msg.to_string())).await?;
-        info!("✅ 已发送订阅请求，共 {} 个 token", all_token_ids.len());
-    }
-
-    info!("✅ WebSocket 连接成功，开始监听价格...");
-
     // 维护每个 token 的最新价格（token_id -> (price_bps, snapshot)）
     let mut token_prices: HashMap<String, (u16, BookSnapshot)> = HashMap::new();
 
-    // 主循环：处理 WebSocket 消息
-    while let Some(msg) = read.next().await {
-        let msg = match msg {
-            Ok(m) => m,
+    // 外层重连循环
+    loop {
+        // 连接 WebSocket
+        info!("🔌 连接 Polymarket WebSocket...");
+
+        let (ws_stream, _) = match connect_async(POLYMARKET_WS_URL).await {
+            Ok(stream) => stream,
             Err(e) => {
-                error!("WebSocket 错误: {}", e);
+                error!("WebSocket 连接失败: {}，3 秒后重试...", e);
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
                 continue;
             }
         };
 
-        if let Message::Text(text) = msg {
-            // 正确的格式：WebSocket 返回的是订单簿数组
-            if let Ok(snapshots) = serde_json::from_str::<Vec<BookSnapshot>>(&text) {
-                // 更新每个 token 的价格
-                for snapshot in snapshots {
-                    if !snapshot.asks.is_empty() {
-                        if let Ok(price_f64) = snapshot.asks[0].price.parse::<f64>() {
-                            let price_bps = (price_f64 * 10000.0) as u16;
-                            token_prices.insert(snapshot.asset_id.clone(), (price_bps, snapshot));
+        let (mut write, mut read) = ws_stream.split();
+
+        // 收集所有需要订阅的 token ID
+        let mut all_token_ids = Vec::new();
+        for asset in &config.enabled_assets {
+            if let Some(round) = round_manager.get_round(asset).await {
+                all_token_ids.push(round.up_token_id.clone());
+                all_token_ids.push(round.down_token_id.clone());
+                info!("📋 准备订阅 {}: {} / {}", asset, round.up_token_id, round.down_token_id);
+            }
+        }
+
+        // 发送订阅消息（参考 src/polymarket.rs 的正确格式）
+        if !all_token_ids.is_empty() {
+            let subscribe_msg = serde_json::json!({
+                "assets_ids": all_token_ids,
+                "type": "market"
+            });
+
+            if let Err(e) = write.send(Message::Text(subscribe_msg.to_string())).await {
+                error!("发送订阅消息失败: {}，3 秒后重试...", e);
+                tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+                continue;
+            }
+            info!("✅ 已发送订阅请求，共 {} 个 token", all_token_ids.len());
+        }
+
+        info!("✅ WebSocket 连接成功，开始监听价格...");
+
+        // 创建定时器：每秒检查轮次是否结束
+        let mut round_check_interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
+
+        // 内层消息处理循环
+        let ws_broken = 'message_loop: loop {
+            tokio::select! {
+                // 定时器：检查轮次结束
+                _ = round_check_interval.tick() => {
+                    for (asset, trader) in &traders {
+                        if trader.round_manager.is_round_ended(asset).await {
+                            if let Some(round) = trader.round_manager.get_round(asset).await {
+                                if let Err(e) = trader.handle_round_end(&round).await {
+                                    error!("轮次切换失败 ({}): {}", asset, e);
+                                } else {
+                                    // 更新 token_prices，清除旧轮次的 token
+                                    if let Some(new_round) = trader.round_manager.get_round(asset).await {
+                                        token_prices.remove(&round.up_token_id);
+                                        token_prices.remove(&round.down_token_id);
+                                        info!("🔄 已清除旧轮次 token 缓存: {} / {}", round.up_token_id, round.down_token_id);
+
+                                        // 重新订阅新轮次的 token
+                                        let new_tokens = vec![new_round.up_token_id.clone(), new_round.down_token_id.clone()];
+                                        let subscribe_msg = serde_json::json!({
+                                            "assets_ids": new_tokens,
+                                            "type": "market"
+                                        });
+
+                                        if let Err(e) = write.send(Message::Text(subscribe_msg.to_string())).await {
+                                            error!("重新订阅失败 ({}): {}，WebSocket 可能已断开", asset, e);
+                                            break 'message_loop true;  // 跳出 message_loop 循环，触发重连
+                                        } else {
+                                            info!("✅ 已重新订阅新轮次: {} / {}", new_round.up_token_id, new_round.down_token_id);
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
 
-                // 对每个资产，检查是否同时有 up 和 down 的价格
-                for (asset, trader) in &traders {
-                    if let Some(round) = round_manager.get_round(asset).await {
-                        // 获取 up 和 down 的真实价格
-                        if let (Some((up_ask, up_snapshot)), Some((down_ask, _down_snapshot))) = (
-                            token_prices.get(&round.up_token_id),
-                            token_prices.get(&round.down_token_id),
-                        ) {
-                            // 使用 up 侧的订单簿快照（两个都可以，选一个即可）
-                            if let Err(e) = trader
-                                .on_price_update(*up_ask, *down_ask, up_snapshot)
-                                .await
-                            {
-                                error!("处理价格更新失败 ({}): {}", asset, e);
+                // WebSocket 消息处理
+                msg_result = read.next() => {
+                    let msg = match msg_result {
+                        Some(Ok(m)) => m,
+                        Some(Err(e)) => {
+                            error!("WebSocket 错误: {}，准备重连...", e);
+                            break true;  // 跳出内层循环，触发重连
+                        }
+                        None => {
+                            warn!("WebSocket 连接关闭，准备重连...");
+                            break true;  // 跳出内层循环，触发重连
+                        }
+                    };
+
+                    if let Message::Text(text) = msg {
+                        // 正确的格式：WebSocket 返回的是订单簿数组
+                        if let Ok(snapshots) = serde_json::from_str::<Vec<BookSnapshot>>(&text) {
+                            // 更新每个 token 的价格
+                            for snapshot in snapshots {
+                                if !snapshot.asks.is_empty() {
+                                    if let Ok(price_f64) = snapshot.asks[0].price.parse::<f64>() {
+                                        let price_bps = (price_f64 * 10000.0) as u16;
+                                        token_prices.insert(snapshot.asset_id.clone(), (price_bps, snapshot));
+                                    }
+                                }
+                            }
+
+                            // 对每个资产，检查是否同时有 up 和 down 的价格
+                            for (asset, trader) in &traders {
+                                if let Some(round) = round_manager.get_round(asset).await {
+                                    // 获取 up 和 down 的真实价格
+                                    if let (Some((up_ask, up_snapshot)), Some((down_ask, _down_snapshot))) = (
+                                        token_prices.get(&round.up_token_id),
+                                        token_prices.get(&round.down_token_id),
+                                    ) {
+                                        // 使用 up 侧的订单簿快照（两个都可以，选一个即可）
+                                        if let Err(e) = trader
+                                            .on_price_update(*up_ask, *down_ask, up_snapshot)
+                                            .await
+                                        {
+                                            error!("处理价格更新失败 ({}): {}", asset, e);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
+        };
+
+        // 如果 WebSocket 断开，等待 3 秒后重连
+        if ws_broken {
+            warn!("⏳ 等待 3 秒后重连...");
+            tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
         }
     }
-
-    Ok(())
 }
 
 
